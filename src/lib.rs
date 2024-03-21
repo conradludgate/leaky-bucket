@@ -226,13 +226,20 @@ use core::task::{Context, Poll, Waker};
 use alloc::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
+use pin_list::Node;
+use pin_list::NodeData;
+use pin_list::PinList;
 use pin_project_lite::pin_project;
 use tokio::time;
 use tracing::trace;
 
-#[doc(hidden)]
-pub mod linked_list;
-use self::linked_list::{LinkedList, Node};
+type PinListTypes = dyn pin_list::Types<
+    Id = pin_list::id::Checked,
+    Protected = Task,
+    // being removed marks as completed
+    Removed = (),
+    Unprotected = (),
+>;
 
 /// Default factor for how to calculate max refill value.
 const DEFAULT_REFILL_MAX_FACTOR: usize = 10;
@@ -249,8 +256,6 @@ const BUMP_LIMIT: usize = 16;
 struct Task {
     /// Remaining tokens that need to be satisfied.
     remaining: usize,
-    /// Link to [Linking::complete].
-    complete: Option<ptr::NonNull<AtomicBool>>,
     /// The waker associated with the node.
     waker: Option<Waker>,
 }
@@ -260,7 +265,6 @@ impl Task {
     const fn new() -> Self {
         Self {
             remaining: 0,
-            complete: None,
             waker: None,
         }
     }
@@ -292,7 +296,7 @@ struct Critical {
     /// to [`RateLimiter::max`].
     balance: usize,
     /// Waiter list.
-    waiters: LinkedList<Task>,
+    waiters: PinList<PinListTypes>,
     /// The deadline for when more tokens can be be added.
     deadline: time::Instant,
     /// If the core is available.
@@ -318,10 +322,10 @@ impl Critical {
         // Safety: We're holding the lock guard to all the waiters so we can be
         // certain that we have exclusive access.
         unsafe {
-            if let Some(mut node) = self.waiters.front_mut() {
-                trace!(node = ?node, "waking next core");
+            if let Some(mut node) = self.waiters.cursor_front_mut().protected_mut() {
+                trace!("waking next core");
 
-                if let Some(waker) = node.as_mut().waker.take() {
+                if let Some(waker) = node.waker.take() {
                     waker.wake();
                 }
             }
@@ -764,7 +768,7 @@ impl Builder {
             fair: self.fair,
             critical: Mutex::new(Critical {
                 balance: initial,
-                waiters: LinkedList::new(),
+                waiters: PinList::new(pin_list::id::Checked::new()),
                 deadline,
                 available: true,
             }),
@@ -816,66 +820,73 @@ pin_project! {
     }
 }
 
-/// Internal state of the acquire. This is separated because it can be computed
-/// in constant time.
-struct AcquireState {
-    /// If we are linked or not.
-    // TODO: replace with initialised from pin-list
-    linked: bool,
-    /// Inner state of the acquire.
-    linking: UnsafeCell<Linking>,
+pin_project! {
+    /// Internal state of the acquire. This is separated because it can be computed
+    /// in constant time.
+    struct AcquireState {
+        // /// If we are linked or not.
+        // // TODO: replace with initialised from pin-list
+        // linked: bool,
+        // /// Inner state of the acquire.
+        // linking: UnsafeCell<Linking>,
+        #[pin]
+        node: Node<PinListTypes>,
+    }
 }
 
 impl AcquireState {
     #[allow(clippy::declare_interior_mutable_const)]
     const INITIAL: AcquireState = AcquireState {
-        linked: false,
-        linking: UnsafeCell::new(Linking {
-            task: Node::new(Task::new()),
-            complete: AtomicBool::new(false),
-            _pin: marker::PhantomPinned,
-        }),
+        // linked: false,
+        // linking: UnsafeCell::new(Linking {
+        //     task: Node::new(Task::new()),
+        //     complete: AtomicBool::new(false),
+        //     _pin: marker::PhantomPinned,
+        // }),
+        node: Node::new(),
     };
 
-    /// Access the completion flag.
-    pub fn complete(&self) -> &AtomicBool {
-        // Safety: This is always safe to access since it's atomic.
-        unsafe { &*addr_of!((*self.linking.get()).complete) }
-    }
+    // /// Access the completion flag.
+    // pub fn complete(&self) -> &AtomicBool {
+    //     // Safety: This is always safe to access since it's atomic.
+    //     unsafe { &*addr_of!((*self.linking.get()).complete) }
+    // }
 
-    /// Get the underlying task.
-    pub unsafe fn task(&self) -> &Node<Task> {
-        &*addr_of!((*self.linking.get()).task)
-    }
+    // /// Get the underlying task.
+    // pub unsafe fn task(&self) -> &Node<Task> {
+    //     &*addr_of!((*self.linking.get()).task)
+    // }
 
-    /// Get the underlying task mutably.
-    pub unsafe fn task_mut(&mut self) -> &mut Node<Task> {
-         &mut *addr_of_mut!((*self.linking.get()).task)
-    }
+    // /// Get the underlying task mutably.
+    // pub unsafe fn task_mut(&mut self) -> &mut Node<Task> {
+    //     &mut *addr_of_mut!((*self.linking.get()).task)
+    // }
 
-    /// Get the underlying task mutably and completion flag as a pair.
-    pub unsafe fn update_project(&mut self) -> (&mut Node<Task>, &AtomicBool, &mut bool) {
-        let node = &mut *addr_of_mut!((*self.linking.get()).task);
-        let complete = &*addr_of!((*self.linking.get()).complete);
-        (node, complete, &mut self.linked)
-    }
+    // /// Get the underlying task mutably and completion flag as a pair.
+    // pub unsafe fn update_project(&mut self) -> (&mut Node<Task>, &AtomicBool, &mut bool) {
+    //     let node = &mut *addr_of_mut!((*self.linking.get()).task);
+    //     let complete = &*addr_of!((*self.linking.get()).complete);
+    //     (node, complete, &mut self.linked)
+    // }
 
     /// Update the waiting state for this acquisition task. This might require
     /// that we update the associated waker.
     #[tracing::instrument(skip(self, critical, waker), level = "trace")]
-    fn update(&mut self, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
-        // Safety: we're ensured to do this under the critical lock since we've
-        // passed the relevant guard in through `waiters`.
-        let (task, complete, linked) = unsafe { self.update_project() };
+    fn update(self: Pin<&mut Self>, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
+        // // Safety: we're ensured to do this under the critical lock since we've
+        // // passed the relevant guard in through `waiters`.
+        // let (task, complete, linked) = unsafe { self.update_project() };
 
-        if !*linked {
-            trace!("linking self");
-            *linked = true;
+        let task = self
+            .project()
+            .node
+            .initialized_mut()
+            .expect("update should only be called when init");
 
-            unsafe {
-                critical.waiters.push_front(task.into());
-            }
-        }
+        // if not protected, then this task was removed and is done
+        let Some(task) = task.protected_mut(&mut critical.waiters) else {
+            return;
+        };
 
         let w = &mut task.waker;
 
@@ -889,61 +900,67 @@ impl AcquireState {
             *w = Some(waker.clone());
         }
 
-        if task.complete.is_none() {
-            trace!("setting complete");
-            task.complete = Some(complete.into());
-        }
+        // if task.complete.is_none() {
+        //     trace!("setting complete");
+        //     task.complete = Some(complete.into());
+        // }
     }
 
-    /// Ensure that the current core task is correctly linked up if needed.
-    #[tracing::instrument(skip(self, critical, lim), level = "trace")]
-    unsafe fn link_core(&mut self, critical: &mut Critical, lim: &RateLimiter) {
-        if lim.fair {
-            // Fair scheduling needs to ensure that the core is part of the wait
-            // queue, and will be woken up in-order with other tasks.
-            if !mem::replace(&mut self.linked, true) {
-                critical.waiters.push_front(self.task_mut().into());
-            }
-        } else {
-            // Unfair scheduling the core task is not supposed to be in the wait
-            // queue, so remove it from there if we've successfully stolen it.
-            // Ensure that the current task is *not* linked since it is now to
-            // become the coordinator for everyone else.
-            if mem::take(&mut self.linked) {
-                critical.waiters.remove(self.task_mut().into());
-            }
-        }
-    }
+    // no longer needed. all tasks will be linked
+    // /// Ensure that the current core task is correctly linked up if needed.
+    // #[tracing::instrument(skip(self, critical, lim), level = "trace")]
+    // unsafe fn link_core(self: Pin<&mut Self>, critical: &mut Critical, lim: &RateLimiter) {
+    //     if lim.fair {
+    //         // Fair scheduling needs to ensure that the core is part of the wait
+    //         // queue, and will be woken up in-order with other tasks.
+    //         if !mem::replace(&mut self.linked, true) {
+    //             critical.waiters.push_front(self.task_mut().into());
+    //         }
+    //     } else {
+    //         // Unfair scheduling the core task is not supposed to be in the wait
+    //         // queue, so remove it from there if we've successfully stolen it.
+    //         // Ensure that the current task is *not* linked since it is now to
+    //         // become the coordinator for everyone else.
+    //         if mem::take(&mut self.linked) {
+    //             critical.waiters.remove(self.task_mut().into());
+    //         }
+    //     }
+    // }
 
     /// Release any remaining tokens which are associated with this particular task.
     unsafe fn release_remaining(
-        &mut self,
+        self: Pin<&mut Self>,
         critical: &mut MutexGuard<'_, Critical>,
         permits: usize,
         lim: &RateLimiter,
     ) {
-        if mem::take(&mut self.linked) {
-            critical.waiters.remove(self.task_mut().into());
-        }
+        let Some(task) = self.project().node.initialized_mut() else {
+            return;
+        };
+        // let Some(mut task) = task.cursor_mut(&mut critical.waiters) else {
+        //     return;
+        // };
+        let (NodeData::Linked(task), _) = task.reset(&mut critical.waiters) else {
+            return;
+        };
+
+        // if mem::take(&mut self.linked) {
+        //     critical.waiters.remove(self.task_mut().into());
+        // }
 
         // Hand back permits which we've acquired so far.
-        let release = permits.saturating_sub(self.linking.get_mut().task.remaining);
+        let release = permits.saturating_sub(task.remaining);
 
         // Temporarily assume the role of core and release the remaining
         // tokens to waiting tasks.
         if release > 0 {
-            self.drain_wait_queue(critical, release, lim);
+            Self::drain_wait_queue(critical, release, lim);
         }
     }
 
     /// Refill the wait queue with the given number of tokens.
-    #[tracing::instrument(skip(self, critical, lim), level = "trace")]
-    fn drain_wait_queue(
-        &self,
-        critical: &mut MutexGuard<'_, Critical>,
-        tokens: usize,
-        lim: &RateLimiter,
-    ) {
+    #[tracing::instrument(skip(critical, lim), level = "trace")]
+    fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim: &RateLimiter) {
         critical.balance = critical.balance.saturating_add(tokens);
         trace!(tokens = tokens, "draining tokens");
 
@@ -953,28 +970,34 @@ impl AcquireState {
         // sure that we have exclusive access to the wait queue.
         unsafe {
             while critical.balance > 0 {
-                let mut node = match critical.waiters.pop_back() {
-                    Some(node) => node,
-                    None => break,
+                let Critical {
+                    balance, waiters, ..
+                } = &mut **critical;
+                let mut cursor = waiters.cursor_back_mut();
+                let Some(n) = cursor.protected_mut() else {
+                    break;
                 };
 
-                let n = node.as_mut();
-                n.fill(&mut critical.balance);
+                n.fill(balance);
 
                 trace! {
-                    balance = critical.balance,
+                    balance = balance,
                     remaining = n.remaining,
                     "filled node",
                 };
 
                 if !n.is_completed() {
-                    critical.waiters.push_back(node);
+                    // critical.waiters.push_back(node);
                     break;
                 }
+                let mut n = cursor
+                    .remove_current(())
+                    .expect("we are certain this node is currently in 'protected' state");
 
-                if let Some(complete) = n.complete.take() {
-                    complete.as_ref().store(true, Ordering::Release);
-                }
+                // removing the node marks it as complete
+                // if let Some(complete) = n.complete.take() {
+                //     complete.as_ref().store(true, Ordering::Release);
+                // }
 
                 if let Some(waker) = n.waker.take() {
                     waker.wake();
@@ -998,36 +1021,47 @@ impl AcquireState {
     /// core has been completed.
     #[tracing::instrument(skip(self, critical, tokens, lim), level = "trace")]
     fn drain_core(
-        &mut self,
+        self: Pin<&mut Self>,
         critical: &mut MutexGuard<'_, Critical>,
         tokens: usize,
         lim: &RateLimiter,
     ) -> bool {
-        self.drain_wait_queue(critical, tokens, lim);
+        Self::drain_wait_queue(critical, tokens, lim);
+        let critical = &mut **critical;
+
+        let init = self
+            .project()
+            .node
+            .initialized_mut()
+            .expect("must be linked at this point");
+        let Some(task) = init.protected_mut(&mut critical.waiters) else {
+            // task was removed, so it was completed when draining the wait queue
+            return true;
+        };
 
         if lim.fair {
-            debug_assert! {
-                self.linked,
-                "core must be linked for fair scheduler",
-            };
+            // debug_assert! {
+            //     self.linked,
+            //     "core must be linked for fair scheduler",
+            // };
 
             // We only need to check the state since the current core holder is
             // linked up to the wait queue.
             //
             // Safety: we're doing this under the critical lock so we know we
             // have exclusive access to the node.
-            if unsafe { self.task().is_completed() } {
-                // Task was unlinked by the drain action.
-                self.linked = false;
-                return true;
-            }
+            // if task.is_completed() {
+            // // Task was unlinked by the drain action.
+            // self.linked = false;
+            // return true;
+            // }
 
             false
         } else {
-            debug_assert! {
-                !self.linked,
-                "core must not be linked for an unfair scheduler",
-            };
+            // debug_assert! {
+            //     !self.linked,
+            //     "core must not be linked for an unfair scheduler",
+            // };
 
             // If the limiter is not fair, we need to in addition to draining
             // remaining tokens from linked nodes, drain it from ourselves. We
@@ -1036,9 +1070,14 @@ impl AcquireState {
             //
             // Safety: we know that no one else holds the task at this point.
             // The in particular the task is not linked into the wait queue.
-            let c = unsafe { &mut *self.task_mut() };
-            c.fill(&mut critical.balance);
-            c.is_completed()
+            // let c = unsafe { &mut *self.task_mut() };
+            task.fill(&mut critical.balance);
+            if task.is_completed() {
+                let mut task = init.cursor_mut(&mut critical.waiters).unwrap();
+                let task = task.remove_current(()).expect("not a ghost cursor");
+                return true;
+            }
+            false
         }
     }
 
@@ -1051,11 +1090,11 @@ impl AcquireState {
     /// ensure that it is pinned.
     #[tracing::instrument(skip(self, critical, lim), level = "trace")]
     unsafe fn assume_core(
-        &mut self,
+        self: Pin<&mut Self>,
         critical: &mut MutexGuard<'_, Critical>,
         lim: &RateLimiter,
     ) -> bool {
-        self.link_core(critical, lim);
+        // self.link_core(critical, lim);
 
         let (tokens, deadline) = match calculate_drain(critical.deadline, lim.interval) {
             Some(tokens) => tokens,
@@ -1204,6 +1243,7 @@ pin_project! {
         #[pin]
         // State of the acquisition.
         state: State,
+        #[pin]
         // The internal acquire state.
         internal: AcquireState,
     }
@@ -1213,15 +1253,16 @@ pin_project! {
         T: AsRef<RateLimiter>,
     {
         fn drop(this: Pin<&mut Self>) {
+            dbg!("dropping");
             let this = this.project();
             let lim = this.lim.as_ref();
 
             match this.state.project() {
                 StateProj::Waiting => unsafe {
-                    debug_assert! {
-                        this.internal.linked,
-                        "waiting nodes have to be linked",
-                    };
+                    // debug_assert! {
+                    //     this.internal.linked,
+                    //     "waiting nodes have to be linked",
+                    // };
 
                     // While the node is linked into the wait queue we have to
                     // ensure it's only accessed under a lock, but once it's been
@@ -1236,7 +1277,12 @@ pin_project! {
                         .release_remaining(&mut critical, *this.permits, lim);
                     critical.release();
                 },
-                _ => (),
+                _ => {
+                    if let Some(init) = this.internal.project().node.initialized_mut() {
+                        let critical = lim.critical.lock();
+                        init.take_removed(&critical.waiters).expect("should not be protected if complete");
+                    }
+                },
             }
         }
     }
@@ -1313,7 +1359,7 @@ where
                         // processes to observe that the deadline has been
                         // reached.
                         critical.deadline = deadline;
-                        this.internal.drain_wait_queue(&mut critical, tokens, lim);
+                        AcquireState::drain_wait_queue(&mut critical, tokens, lim);
                     }
 
                     // Test the fast path first, where we simply subtract the
@@ -1326,25 +1372,41 @@ where
 
                     let balance = mem::take(&mut critical.balance);
 
-                    // Safety: This is done in a pinned section, so we know that
-                    // the linked section stays alive for the duration of this
-                    // future due to pinning guarantees.
-                    unsafe {
-                        this.internal.task_mut().remaining = *this.permits - balance;
-                    }
+                    match this.internal.as_mut().project().node.initialized_mut() {
+                        None => {
+                            trace!("linking self");
+
+                            critical.waiters.push_front(
+                                this.internal.as_mut().project().node,
+                                Task {
+                                    remaining: *this.permits - balance,
+                                    waker: None,
+                                },
+                                (),
+                            )
+                        }
+                        Some(_) => panic!("should not be initialised yet"),
+                    };
+
+                    // // Safety: This is done in a pinned section, so we know that
+                    // // the linked section stays alive for the duration of this
+                    // // future due to pinning guarantees.
+                    // unsafe {
+                    //     this.internal.task_mut().remaining = *this.permits - balance;
+                    // }
 
                     // Try to take over as core. If we're unsuccessful we just
                     // ensure that we're linked into the wait queue.
                     if !mem::take(&mut critical.available) {
-                        this.internal.update(&mut critical, cx.waker());
+                        this.internal.as_mut().update(&mut critical, cx.waker());
                         this.state.set(State::Waiting);
                         return Poll::Pending;
                     }
 
-                    // Safety: This is done in a pinned section, so we know that
-                    // the linked section stays alive for the duration of this
-                    // future due to pinning guarantees.
-                    unsafe { this.internal.link_core(&mut critical, lim) };
+                    // // Safety: This is done in a pinned section, so we know that
+                    // // the linked section stays alive for the duration of this
+                    // // future due to pinning guarantees.
+                    // unsafe { this.internal.link_core(&mut critical, lim) };
 
                     trace!(until = ?critical.deadline, "taking over core and sleeping");
                     this.state.set(State::Core {
@@ -1354,31 +1416,47 @@ where
                     trace!("no immediate tokens available");
                 }
                 StateProj::Waiting => {
+                    let init = this
+                        .internal
+                        .as_mut()
+                        .project()
+                        .node
+                        .initialized_mut()
+                        .expect("node must be initialised if waiting");
+
                     // If we are complete, then return as ready.
                     //
                     // This field is atomic, so we can safely read it under shared
                     // access and do not require a lock.
-                    if this.internal.complete().load(Ordering::Acquire) {
+                    // if this.internal.complete().load(Ordering::Acquire) {
+                    //     this.state.set(State::Complete);
+                    //     return Poll::Ready(());
+                    // }
+
+                    let mut critical = lim.critical.lock();
+
+                    let Some(_) = init.protected_mut(&mut critical.waiters) else {
+                        // if removed, we are complete
                         this.state.set(State::Complete);
                         return Poll::Ready(());
-                    }
+                    };
 
                     // Note: we need to operate under this lock to ensure that
                     // the core acquired here (or elsewhere) observes that the
                     // current task has been linked up.
-                    let mut critical = lim.critical.lock();
+                    // let mut critical = lim.critical.lock();
 
                     // Try to take over as core. If we're unsuccessful we
                     // just ensure that we're linked into the wait queue.
                     if !mem::take(&mut critical.available) {
-                        this.internal.update(&mut critical, cx.waker());
+                        this.internal.as_mut().update(&mut critical, cx.waker());
                         return Poll::Pending;
                     }
 
                     // Safety: This is done in a pinned section, so we know that
                     // the linked section stays alive for the duration of this
                     // future due to pinning guarantees.
-                    let assumed = unsafe { this.internal.assume_core(&mut critical, lim) };
+                    let assumed = unsafe { this.internal.as_mut().assume_core(&mut critical, lim) };
 
                     if !assumed {
                         // Marks as completed.
@@ -1403,7 +1481,11 @@ where
 
                     // Safety: we know that we're the only one with access to core
                     // because we ensured it as we acquire the `available` lock.
-                    if this.internal.drain_core(&mut critical, lim.refill, lim) {
+                    if this
+                        .internal
+                        .as_mut()
+                        .drain_core(&mut critical, lim.refill, lim)
+                    {
                         critical.release();
                         this.state.set(State::Complete);
                         return Poll::Ready(());
@@ -1420,27 +1502,27 @@ where
     }
 }
 
-/// All of the state that is linked into the wait queue.
-///
-/// This is only ever accessed through raw pointer manipulation to avoid issues
-/// with field aliasing.
-struct Linking {
-    /// The node in the linked list.
-    task: Node<Task>,
-    /// If this node has been released or not. We make this an atomic to permit
-    /// access to it without synchronization.
-    //
-    // This is set once and only once: `drain_wait_queue` when remaining = 0.
-    // This is loaded only while waiting.
-    //
-    // TODO: Signalled instead by being unlinked from the wait queue
-    // unlink during drawin_wait_queue when remaining = 0
-    // complete if unlinked and not holding the core.
-    complete: AtomicBool,
-    /// Avoids noalias heuristics from kicking in on references to a `Linking`
-    /// struct.
-    _pin: marker::PhantomPinned,
-}
+// /// All of the state that is linked into the wait queue.
+// ///
+// /// This is only ever accessed through raw pointer manipulation to avoid issues
+// /// with field aliasing.
+// struct Linking {
+//     /// The node in the linked list.
+//     task: Node<Task>,
+//     /// If this node has been released or not. We make this an atomic to permit
+//     /// access to it without synchronization.
+//     //
+//     // This is set once and only once: `drain_wait_queue` when remaining = 0.
+//     // This is loaded only while waiting.
+//     //
+//     // TODO: Signalled instead by being unlinked from the wait queue
+//     // unlink during drawin_wait_queue when remaining = 0
+//     // complete if unlinked and not holding the core.
+//     complete: AtomicBool,
+//     /// Avoids noalias heuristics from kicking in on references to a `Linking`
+//     /// struct.
+//     _pin: marker::PhantomPinned,
+// }
 
 /// Calculate refill amount. Returning a tuple of how much to fill and remaining
 /// duration to sleep until the next refill time if appropriate.
