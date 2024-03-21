@@ -218,6 +218,8 @@ use core::marker;
 use core::mem;
 use core::pin::Pin;
 use core::ptr;
+use core::ptr::addr_of;
+use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -837,31 +839,23 @@ impl AcquireState {
     /// Access the completion flag.
     pub fn complete(&self) -> &AtomicBool {
         // Safety: This is always safe to access since it's atomic.
-        unsafe {
-            let ptr = self.linking.get() as *const _ as *const Node<Task>;
-            let ptr = ptr.add(1) as *const AtomicBool;
-            &*ptr
-        }
+        unsafe { &*addr_of!((*self.linking.get()).complete) }
     }
 
     /// Get the underlying task.
     pub unsafe fn task(&self) -> &Node<Task> {
-        let ptr = self.linking.get() as *mut Node<Task>;
-        &*ptr
+        &*addr_of!((*self.linking.get()).task)
     }
 
     /// Get the underlying task mutably.
     pub unsafe fn task_mut(&mut self) -> &mut Node<Task> {
-        let ptr = self.linking.get() as *mut Node<Task>;
-        &mut *ptr
+         &mut *addr_of_mut!((*self.linking.get()).task)
     }
 
     /// Get the underlying task mutably and completion flag as a pair.
     pub unsafe fn update_project(&mut self) -> (&mut Node<Task>, &AtomicBool, &mut bool) {
-        let node = self.linking.get() as *mut Node<Task>;
-        let complete = node.add(1) as *const _ as *const AtomicBool;
-        let node = &mut *(node as *mut Node<Task>);
-        let complete = &*complete;
+        let node = &mut *addr_of_mut!((*self.linking.get()).task);
+        let complete = &*addr_of!((*self.linking.get()).complete);
         (node, complete, &mut self.linked)
     }
 
