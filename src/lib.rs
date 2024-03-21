@@ -860,16 +860,9 @@ impl AcquireState {
         let Some(task) = self.project().node.initialized_mut() else {
             return;
         };
-        // let Some(mut task) = task.cursor_mut(&mut critical.waiters) else {
-        //     return;
-        // };
         let (NodeData::Linked(task), _) = task.reset(&mut critical.waiters) else {
             return;
         };
-
-        // if mem::take(&mut self.linked) {
-        //     critical.waiters.remove(self.task_mut().into());
-        // }
 
         // Hand back permits which we've acquired so far.
         let release = permits.saturating_sub(task.remaining);
@@ -1152,14 +1145,12 @@ pin_project! {
             let mut this = this.project();
             let lim = this.lim.as_ref();
 
-            if let Some(init) = this.internal.as_mut().project().node.initialized_mut() {
+            if let Some(_init) = this.internal.as_mut().project().node.initialized_mut() {
                 let mut critical = lim.critical.lock();
-                if let NodeData::Linked(_task) = init.reset(&mut critical.waiters).0 {
-                    this.internal
-                        .release_remaining(&mut critical, *this.permits, lim);
-                    if this.core.is_some() {
-                        critical.release();
-                    }
+                this.internal
+                    .release_remaining(&mut critical, *this.permits, lim);
+                if this.core.is_some() {
+                    critical.release();
                 }
             }
         }
@@ -1230,11 +1221,18 @@ where
                         AcquireState::drain_wait_queue(&mut critical, tokens, lim);
                     }
 
+                    let critical = &mut *critical;
+
+                    // Test the fast path first, where we simply subtract the
+                    // permits available from the current balance.
+                    if let Some(balance) = critical.balance.checked_sub(*this.permits) {
+                        critical.balance = balance;
+                        return Poll::Ready(());
+                    }
+
                     let balance = mem::take(&mut critical.balance);
 
                     trace!("linking self");
-
-                    let critical = &mut *critical;
 
                     let task = critical.waiters.push_front(
                         this.internal.as_mut().project().node,
