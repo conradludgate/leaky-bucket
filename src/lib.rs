@@ -820,6 +820,7 @@ pin_project! {
 /// in constant time.
 struct AcquireState {
     /// If we are linked or not.
+    // TODO: replace with initialised from pin-list
     linked: bool,
     /// Inner state of the acquire.
     linking: UnsafeCell<Linking>,
@@ -1423,12 +1424,18 @@ where
 ///
 /// This is only ever accessed through raw pointer manipulation to avoid issues
 /// with field aliasing.
-#[repr(C)]
 struct Linking {
     /// The node in the linked list.
     task: Node<Task>,
     /// If this node has been released or not. We make this an atomic to permit
     /// access to it without synchronization.
+    //
+    // This is set once and only once: `drain_wait_queue` when remaining = 0.
+    // This is loaded only while waiting.
+    //
+    // TODO: Signalled instead by being unlinked from the wait queue
+    // unlink during drawin_wait_queue when remaining = 0
+    // complete if unlinked and not holding the core.
     complete: AtomicBool,
     /// Avoids noalias heuristics from kicking in on references to a `Linking`
     /// struct.
