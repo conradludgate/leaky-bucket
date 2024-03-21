@@ -220,9 +220,9 @@ use core::task::{Context, Poll, Waker};
 use alloc::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard};
-use pin_list::Node;
 use pin_list::NodeData;
 use pin_list::PinList;
+use pin_list::{InitializedNode, Node};
 use pin_project_lite::pin_project;
 use tokio::time::{self, Sleep};
 use tracing::trace;
@@ -304,9 +304,6 @@ impl Critical {
         // We have to do this, because another task might miss that the core is
         // available since it's hidden behind an atomic, so we wake any task up
         // to ensure that it will always be picked up.
-        //
-        // Safety: We're holding the lock guard to all the waiters so we can be
-        // certain that we have exclusive access.
         {
             if let Some(node) = self.waiters.cursor_front_mut().protected_mut() {
                 trace!("waking next core");
@@ -826,41 +823,16 @@ impl Task {
             *w = Some(waker.clone());
         }
     }
-}
-
-impl AcquireState {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const INITIAL: AcquireState = AcquireState { node: Node::new() };
-
-    /// Update the waiting state for this acquisition task. This might require
-    /// that we update the associated waker.
-    #[tracing::instrument(skip(self, critical, waker), level = "trace")]
-    fn update(self: Pin<&mut Self>, critical: &mut MutexGuard<'_, Critical>, waker: &Waker) {
-        let task = self
-            .project()
-            .node
-            .initialized_mut()
-            .expect("update should only be called when init");
-
-        // if not protected, then this task was removed and is done
-        let Some(task) = task.protected_mut(&mut critical.waiters) else {
-            return;
-        };
-
-        task.update(waker)
-    }
 
     /// Release any remaining tokens which are associated with this particular task.
-    fn release_remaining(
-        self: Pin<&mut Self>,
+    fn release_remaining<'a>(
+        init: Pin<&'a mut InitializedNode<'a, PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         permits: usize,
         lim: &RateLimiter,
     ) {
-        let Some(task) = self.project().node.initialized_mut() else {
-            return;
-        };
-        let (NodeData::Linked(task), _) = task.reset(&mut critical.waiters) else {
+        let (NodeData::Linked(task), _) = init.reset(&mut critical.waiters) else {
+            // todo: should release permits?
             return;
         };
 
@@ -870,84 +842,23 @@ impl AcquireState {
         // Temporarily assume the role of core and release the remaining
         // tokens to waiting tasks.
         if release > 0 {
-            Self::drain_wait_queue(critical, release, lim);
-        }
-    }
-
-    /// Refill the wait queue with the given number of tokens.
-    #[tracing::instrument(skip(critical, lim), level = "trace")]
-    fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim: &RateLimiter) {
-        critical.balance = critical.balance.saturating_add(tokens);
-        trace!(tokens = tokens, "draining tokens");
-
-        let mut bump = 0;
-
-        // Safety: we're holding the lock guard to all the waiters so we can be
-        // sure that we have exclusive access to the wait queue.
-        {
-            while critical.balance > 0 {
-                let Critical {
-                    balance, waiters, ..
-                } = &mut **critical;
-                let mut cursor = waiters.cursor_back_mut();
-                let Some(n) = cursor.protected_mut() else {
-                    break;
-                };
-
-                n.fill(balance);
-
-                trace! {
-                    balance = balance,
-                    remaining = n.remaining,
-                    "filled node",
-                };
-
-                if !n.is_completed() {
-                    // critical.waiters.push_back(node);
-                    break;
-                }
-                let mut n = cursor
-                    .remove_current(())
-                    .expect("we are certain this node is currently in 'protected' state");
-
-                // removing the node marks it as complete
-                // if let Some(complete) = n.complete.take() {
-                //     complete.as_ref().store(true, Ordering::Release);
-                // }
-
-                if let Some(waker) = n.waker.take() {
-                    waker.wake();
-                }
-
-                bump += 1;
-
-                if bump == BUMP_LIMIT {
-                    MutexGuard::bump(critical);
-                    bump = 0;
-                }
-            }
-        }
-
-        if critical.balance > lim.max {
-            critical.balance = lim.max;
+            drain_wait_queue(critical, release, lim);
         }
     }
 
     /// Drain the given number of tokens through the core. Returns `true` if the
     /// core has been completed.
-    #[tracing::instrument(skip(self, critical, tokens, lim), level = "trace")]
+    #[tracing::instrument(skip(node, critical, tokens, lim), level = "trace")]
     fn drain_core(
-        self: Pin<&mut Self>,
+        node: Pin<&mut Node<PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         tokens: usize,
         lim: &RateLimiter,
     ) -> bool {
-        Self::drain_wait_queue(critical, tokens, lim);
+        drain_wait_queue(critical, tokens, lim);
         let critical = &mut **critical;
 
-        let init = self
-            .project()
-            .node
+        let init = node
             .initialized_mut()
             .expect("must be linked at this point");
         let Some(task) = init.protected_mut(&mut critical.waiters) else {
@@ -972,14 +883,9 @@ impl AcquireState {
 
     /// Assume the current core and calculate how long we must sleep for in
     /// order to do it.
-    ///
-    /// # Safety
-    ///
-    /// This might link the current task into the task queue, so the caller must
-    /// ensure that it is pinned.
-    #[tracing::instrument(skip(self, critical, lim), level = "trace")]
+    #[tracing::instrument(skip(node, critical, lim), level = "trace")]
     fn assume_core(
-        self: Pin<&mut Self>,
+        node: Pin<&mut Node<PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         lim: &RateLimiter,
     ) -> bool {
@@ -993,7 +899,7 @@ impl AcquireState {
         // It is appropriate to update the deadline.
         critical.deadline = deadline;
 
-        if self.drain_core(critical, tokens, lim) {
+        if Self::drain_core(node, critical, tokens, lim) {
             // We synthetically "ran" at the current time minus the remaining time
             // we need to wait until the last update period.
             critical.release();
@@ -1003,6 +909,63 @@ impl AcquireState {
         true
     }
 }
+
+/// Refill the wait queue with the given number of tokens.
+#[tracing::instrument(skip(critical, lim), level = "trace")]
+fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim: &RateLimiter) {
+    critical.balance = critical.balance.saturating_add(tokens);
+    trace!(tokens = tokens, "draining tokens");
+
+    let mut bump = 0;
+
+    while critical.balance > 0 {
+        let Critical {
+            balance, waiters, ..
+        } = &mut **critical;
+        let mut cursor = waiters.cursor_back_mut();
+        let Some(n) = cursor.protected_mut() else {
+            break;
+        };
+
+        n.fill(balance);
+
+        trace! {
+            balance = balance,
+            remaining = n.remaining,
+            "filled node",
+        };
+
+        if !n.is_completed() {
+            // critical.waiters.push_back(node);
+            break;
+        }
+        let mut n = cursor
+            .remove_current(())
+            .expect("we are certain this node is currently in 'protected' state");
+
+        // removing the node marks it as complete
+        // if let Some(complete) = n.complete.take() {
+        //     complete.as_ref().store(true, Ordering::Release);
+        // }
+
+        if let Some(waker) = n.waker.take() {
+            waker.wake();
+        }
+
+        bump += 1;
+
+        if bump == BUMP_LIMIT {
+            MutexGuard::bump(critical);
+            bump = 0;
+        }
+    }
+
+    if critical.balance > lim.max {
+        critical.balance = lim.max;
+    }
+}
+
+impl AcquireState {}
 
 impl fmt::Debug for AcquireState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1134,7 +1097,7 @@ pin_project! {
         core: Option<Sleep>,
         #[pin]
         // The internal acquire state.
-        internal: AcquireState,
+        internal: Node<PinListTypes>,
     }
 
     impl<T> PinnedDrop for AcquireFut<T>
@@ -1145,10 +1108,9 @@ pin_project! {
             let mut this = this.project();
             let lim = this.lim.as_ref();
 
-            if let Some(_init) = this.internal.as_mut().project().node.initialized_mut() {
+            if let Some(init) = this.internal.as_mut().initialized_mut() {
                 let mut critical = lim.critical.lock();
-                this.internal
-                    .release_remaining(&mut critical, *this.permits, lim);
+                Task::release_remaining(init, &mut critical, *this.permits, lim);
                 if this.core.is_some() {
                     critical.release();
                 }
@@ -1167,7 +1129,7 @@ where
             lim,
             permits,
             core: None,
-            internal: AcquireState::INITIAL,
+            internal: Node::new(),
         }
     }
 
@@ -1187,7 +1149,7 @@ where
         let lim = this.lim.as_ref();
 
         loop {
-            match this.internal.as_mut().project().node.initialized_mut() {
+            match this.internal.as_mut().initialized_mut() {
                 None => {
                     if *this.permits == 0 {
                         return Poll::Ready(());
@@ -1218,7 +1180,7 @@ where
                         // processes to observe that the deadline has been
                         // reached.
                         critical.deadline = deadline;
-                        AcquireState::drain_wait_queue(&mut critical, tokens, lim);
+                        drain_wait_queue(&mut critical, tokens, lim);
                     }
 
                     let critical = &mut *critical;
@@ -1235,7 +1197,7 @@ where
                     trace!("linking self");
 
                     let task = critical.waiters.push_front(
-                        this.internal.as_mut().project().node,
+                        this.internal.as_mut(),
                         Task {
                             remaining: *this.permits - balance,
                             waker: None,
@@ -1262,21 +1224,22 @@ where
                     match this.core.as_mut().as_pin_mut() {
                         None => {
                             let mut critical = lim.critical.lock();
+                            let critical2 = &mut *critical;
 
-                            let Some(_) = init.protected_mut(&mut critical.waiters) else {
+                            let Some(task) = init.protected_mut(&mut critical2.waiters) else {
                                 // if removed, we are complete
                                 return Poll::Ready(());
                             };
 
                             // Try to take over as core. If we're unsuccessful we
                             // just ensure that we're linked into the wait queue.
-                            if !mem::take(&mut critical.available) {
-                                this.internal.as_mut().update(&mut critical, cx.waker());
+                            if !mem::take(&mut critical2.available) {
+                                task.update(cx.waker());
                                 return Poll::Pending;
                             }
 
                             let assumed =
-                                { this.internal.as_mut().assume_core(&mut critical, lim) };
+                                Task::assume_core(this.internal.as_mut(), &mut critical, lim);
 
                             if !assumed {
                                 return Poll::Ready(());
@@ -1297,11 +1260,12 @@ where
 
                             // Safety: we know that we're the only one with access to core
                             // because we ensured it as we acquire the `available` lock.
-                            if this
-                                .internal
-                                .as_mut()
-                                .drain_core(&mut critical, lim.refill, lim)
-                            {
+                            if Task::drain_core(
+                                this.internal.as_mut(),
+                                &mut critical,
+                                lim.refill,
+                                lim,
+                            ) {
                                 critical.release();
                                 this.core.set(None);
                                 return Poll::Ready(());
