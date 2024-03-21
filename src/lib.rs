@@ -1138,17 +1138,11 @@ pin_project! {
         T: AsRef<RateLimiter>,
     {
         fn drop(this: Pin<&mut Self>) {
-            dbg!("dropping");
             let this = this.project();
             let lim = this.lim.as_ref();
 
             match this.state.project() {
                 StateProj::Waiting =>  {
-                    // debug_assert! {
-                    //     this.internal.linked,
-                    //     "waiting nodes have to be linked",
-                    // };
-
                     // While the node is linked into the wait queue we have to
                     // ensure it's only accessed under a lock, but once it's been
                     // unlinked we can do what we want with it.
