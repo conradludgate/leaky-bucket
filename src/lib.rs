@@ -820,16 +820,67 @@ impl Task {
             drain_wait_queue(critical, release, lim);
         }
     }
+}
 
+/// Refill the wait queue with the given number of tokens.
+#[tracing::instrument(skip(critical, lim), level = "trace")]
+fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim: &RateLimiter) {
+    critical.balance = critical.balance.saturating_add(tokens);
+    trace!(tokens = tokens, "draining tokens");
+
+    let mut bump = 0;
+
+    while critical.balance > 0 {
+        let Critical {
+            balance, waiters, ..
+        } = &mut **critical;
+        let mut cursor = waiters.cursor_back_mut();
+        let Some(n) = cursor.protected_mut() else {
+            break;
+        };
+
+        n.fill(balance);
+
+        trace! {
+            balance = balance,
+            remaining = n.remaining,
+            "filled node",
+        };
+
+        if !n.is_completed() {
+            break;
+        }
+        let mut n = cursor
+            .remove_current(())
+            .expect("we are certain this node is currently in 'protected' state");
+
+        if let Some(waker) = n.waker.take() {
+            waker.wake();
+        }
+
+        bump += 1;
+
+        if bump == BUMP_LIMIT {
+            MutexGuard::bump(critical);
+            bump = 0;
+        }
+    }
+
+    if critical.balance > lim.max {
+        critical.balance = lim.max;
+    }
+}
+
+impl Core {
     /// Drain the given number of tokens through the core. Returns `true` if the
     /// core has been completed.
-    #[tracing::instrument(skip(node, critical, tokens, lim, _core), level = "trace")]
+    #[tracing::instrument(skip(self, node, critical, tokens, lim), level = "trace")]
     fn drain_core(
+        &self,
         node: Pin<&mut Node<PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         tokens: usize,
         lim: &RateLimiter,
-        _core: &Core,
     ) -> bool {
         drain_wait_queue(critical, tokens, lim);
         let critical = &mut **critical;
@@ -859,86 +910,31 @@ impl Task {
 
     /// Assume the current core and calculate how long we must sleep for in
     /// order to do it.
-    #[tracing::instrument(skip(node, critical, lim, core), level = "trace")]
+    #[tracing::instrument(skip(self, node, critical, lim), level = "trace")]
     fn assume_core(
+        self,
         node: Pin<&mut Node<PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         lim: &RateLimiter,
-        core: Core,
     ) -> Option<Core> {
         // self.link_core(critical, lim);
 
         let (tokens, deadline) = match calculate_drain(critical.deadline, lim.interval) {
             Some(tokens) => tokens,
-            None => return Some(core),
+            None => return Some(self),
         };
 
         // It is appropriate to update the deadline.
         critical.deadline = deadline;
 
-        if Self::drain_core(node, critical, tokens, lim, &core) {
+        if self.drain_core(node, critical, tokens, lim) {
             // We synthetically "ran" at the current time minus the remaining time
             // we need to wait until the last update period.
-            critical.release(core);
+            critical.release(self);
             return None;
         }
 
-        Some(core)
-    }
-}
-
-/// Refill the wait queue with the given number of tokens.
-#[tracing::instrument(skip(critical, lim), level = "trace")]
-fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim: &RateLimiter) {
-    critical.balance = critical.balance.saturating_add(tokens);
-    trace!(tokens = tokens, "draining tokens");
-
-    let mut bump = 0;
-
-    while critical.balance > 0 {
-        let Critical {
-            balance, waiters, ..
-        } = &mut **critical;
-        let mut cursor = waiters.cursor_back_mut();
-        let Some(n) = cursor.protected_mut() else {
-            break;
-        };
-
-        n.fill(balance);
-
-        trace! {
-            balance = balance,
-            remaining = n.remaining,
-            "filled node",
-        };
-
-        if !n.is_completed() {
-            // critical.waiters.push_back(node);
-            break;
-        }
-        let mut n = cursor
-            .remove_current(())
-            .expect("we are certain this node is currently in 'protected' state");
-
-        // removing the node marks it as complete
-        // if let Some(complete) = n.complete.take() {
-        //     complete.as_ref().store(true, Ordering::Release);
-        // }
-
-        if let Some(waker) = n.waker.take() {
-            waker.wake();
-        }
-
-        bump += 1;
-
-        if bump == BUMP_LIMIT {
-            MutexGuard::bump(critical);
-            bump = 0;
-        }
-    }
-
-    if critical.balance > lim.max {
-        critical.balance = lim.max;
+        Some(self)
     }
 }
 
@@ -1219,7 +1215,7 @@ where
                             };
 
                             let Some(core) =
-                                Task::assume_core(this.internal.as_mut(), &mut critical, lim, core)
+                                core.assume_core(this.internal.as_mut(), &mut critical, lim)
                             else {
                                 // if assume_core does not return the core back, that means we are completed
                                 return Poll::Ready(());
@@ -1242,23 +1238,21 @@ where
                             let mut critical = lim.critical.lock();
                             critical.deadline = now + lim.interval;
 
-                            // Safety: we know that we're the only one with access to core
-                            // because we ensured it as we acquire the `available` lock.
-                            if Task::drain_core(
+                            let core = coresleep.core.take().expect("core will always be set");
+
+                            if core.drain_core(
                                 this.internal.as_mut(),
                                 &mut critical,
                                 lim.refill,
                                 lim,
-                                coresleep.core.as_ref().expect("core will always be Some"),
                             ) {
-                                critical.release(
-                                    coresleep.core.take().expect("core will always be Some"),
-                                );
+                                critical.release(core);
                                 this.core.set(None);
                                 return Poll::Ready(());
                             }
 
                             trace!(sleep = ?lim.interval, "keeping core and sleeping");
+                            *coresleep.core = Some(core);
                             coresleep.sleep.as_mut().reset(critical.deadline);
                         }
                     }
