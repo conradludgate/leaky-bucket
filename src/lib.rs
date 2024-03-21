@@ -211,8 +211,8 @@ extern crate alloc;
 extern crate std;
 
 use core::convert::TryFrom as _;
-use core::fmt;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -286,16 +286,20 @@ struct Critical {
     /// The deadline for when more tokens can be be added.
     deadline: time::Instant,
     /// If the core is available.
-    available: bool,
+    available: Option<Core>,
+}
+
+struct Core {
+    __do_not_construct: PhantomData<()>,
 }
 
 impl Critical {
     /// Release the current core. Beyond this point the current task may no
     /// longer interact exclusively with the core.
-    #[tracing::instrument(skip(self), level = "trace")]
-    fn release(&mut self) {
+    #[tracing::instrument(skip(self, core), level = "trace")]
+    fn release(&mut self, core: Core) {
         trace!("releasing core");
-        self.available = true;
+        self.available = Some(core);
 
         // Find another task that might take over as core. Once it has acquired
         // core status it will have to make sure it is no longer linked into the
@@ -747,7 +751,10 @@ impl Builder {
                 balance: initial,
                 waiters: PinList::new(pin_list::id::Checked::new()),
                 deadline,
-                available: true,
+                available: Some(Core {
+                    // ok to construct as we are creating the RateLimiter for the first time
+                    __do_not_construct: PhantomData,
+                }),
             }),
         }
     }
@@ -771,38 +778,6 @@ impl Default for Builder {
             interval: time::Duration::from_millis(100),
             fair: true,
         }
-    }
-}
-
-pin_project! {
-    /// The state of an acquire operation.
-    #[project = StateProj]
-    #[allow(clippy::large_enum_variant)]
-    enum State {
-        // Initial unconfigured state.
-        Initial,
-        // The acquire is waiting to be released by the core.
-        Waiting,
-        // This operation is currently the core.
-        //
-        // We need to take care to ensure that we don't move the configured sleep.
-        // Since it needs to be pinned to be polled.
-        Core {
-            #[pin]
-            // The current sleep of the core.
-            sleep: time::Sleep,
-        },
-        // The operation is completed.
-        Complete,
-    }
-}
-
-pin_project! {
-    /// Internal state of the acquire. This is separated because it can be computed
-    /// in constant time.
-    struct AcquireState {
-        #[pin]
-        node: Node<PinListTypes>,
     }
 }
 
@@ -848,12 +823,13 @@ impl Task {
 
     /// Drain the given number of tokens through the core. Returns `true` if the
     /// core has been completed.
-    #[tracing::instrument(skip(node, critical, tokens, lim), level = "trace")]
+    #[tracing::instrument(skip(node, critical, tokens, lim, _core), level = "trace")]
     fn drain_core(
         node: Pin<&mut Node<PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         tokens: usize,
         lim: &RateLimiter,
+        _core: &Core,
     ) -> bool {
         drain_wait_queue(critical, tokens, lim);
         let critical = &mut **critical;
@@ -883,30 +859,31 @@ impl Task {
 
     /// Assume the current core and calculate how long we must sleep for in
     /// order to do it.
-    #[tracing::instrument(skip(node, critical, lim), level = "trace")]
+    #[tracing::instrument(skip(node, critical, lim, core), level = "trace")]
     fn assume_core(
         node: Pin<&mut Node<PinListTypes>>,
         critical: &mut MutexGuard<'_, Critical>,
         lim: &RateLimiter,
-    ) -> bool {
+        core: Core,
+    ) -> Option<Core> {
         // self.link_core(critical, lim);
 
         let (tokens, deadline) = match calculate_drain(critical.deadline, lim.interval) {
             Some(tokens) => tokens,
-            None => return true,
+            None => return Some(core),
         };
 
         // It is appropriate to update the deadline.
         critical.deadline = deadline;
 
-        if Self::drain_core(node, critical, tokens, lim) {
+        if Self::drain_core(node, critical, tokens, lim, &core) {
             // We synthetically "ran" at the current time minus the remaining time
             // we need to wait until the last update period.
-            critical.release();
-            return false;
+            critical.release(core);
+            return None;
         }
 
-        true
+        Some(core)
     }
 }
 
@@ -962,14 +939,6 @@ fn drain_wait_queue(critical: &mut MutexGuard<'_, Critical>, tokens: usize, lim:
 
     if critical.balance > lim.max {
         critical.balance = lim.max;
-    }
-}
-
-impl AcquireState {}
-
-impl fmt::Debug for AcquireState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AcquireState").finish()
     }
 }
 
@@ -1084,6 +1053,14 @@ impl Future for AcquireOwned {
 }
 
 pin_project! {
+    struct CoreSleep {
+        core: Option<Core>,
+        #[pin]
+        sleep: Sleep,
+    }
+}
+
+pin_project! {
     struct AcquireFut<T>
     where
         T: AsRef<RateLimiter>,
@@ -1094,7 +1071,7 @@ pin_project! {
         permits: usize,
         #[pin]
         // State of the acquisition.
-        core: Option<Sleep>,
+        core: Option<CoreSleep>,
         #[pin]
         // The internal acquire state.
         internal: Node<PinListTypes>,
@@ -1111,8 +1088,8 @@ pin_project! {
             if let Some(init) = this.internal.as_mut().initialized_mut() {
                 let mut critical = lim.critical.lock();
                 Task::release_remaining(init, &mut critical, *this.permits, lim);
-                if this.core.is_some() {
-                    critical.release();
+                if let Some(core) = this.core.as_pin_mut().and_then(|c| c.project().core.take()) {
+                    critical.release(core);
                 }
             }
         }
@@ -1210,13 +1187,16 @@ where
 
                     // Try to take over as core. If we're unsuccessful we just
                     // ensure that we're linked into the wait queue.
-                    if !mem::take(&mut critical.available) {
+                    let Some(core) = critical.available.take() else {
                         task.update(cx.waker());
                         return Poll::Pending;
-                    }
+                    };
 
                     trace!(until = ?critical.deadline, "taking over core and sleeping");
-                    this.core.set(Some(time::sleep_until(critical.deadline)));
+                    this.core.set(Some(CoreSleep {
+                        core: Some(core),
+                        sleep: time::sleep_until(critical.deadline),
+                    }));
 
                     trace!("no immediate tokens available");
                 }
@@ -1231,25 +1211,29 @@ where
                                 return Poll::Ready(());
                             };
 
-                            // Try to take over as core. If we're unsuccessful we
-                            // just ensure that we're linked into the wait queue.
-                            if !mem::take(&mut critical2.available) {
+                            // Try to take over as core. If we're unsuccessful we just
+                            // ensure that we're linked into the wait queue.
+                            let Some(core) = critical2.available.take() else {
                                 task.update(cx.waker());
                                 return Poll::Pending;
-                            }
+                            };
 
-                            let assumed =
-                                Task::assume_core(this.internal.as_mut(), &mut critical, lim);
-
-                            if !assumed {
+                            let Some(core) =
+                                Task::assume_core(this.internal.as_mut(), &mut critical, lim, core)
+                            else {
+                                // if assume_core does not return the core back, that means we are completed
                                 return Poll::Ready(());
-                            }
+                            };
 
                             trace!(until = ?critical.deadline, "taking over core and sleeping");
-                            this.core.set(Some(time::sleep_until(critical.deadline)));
+                            this.core.set(Some(CoreSleep {
+                                core: Some(core),
+                                sleep: time::sleep_until(critical.deadline),
+                            }));
                         }
-                        Some(mut sleep) => {
-                            if sleep.as_mut().poll(cx).is_pending() {
+                        Some(coresleep) => {
+                            let mut coresleep = coresleep.project();
+                            if coresleep.sleep.as_mut().poll(cx).is_pending() {
                                 return Poll::Pending;
                             }
 
@@ -1265,14 +1249,17 @@ where
                                 &mut critical,
                                 lim.refill,
                                 lim,
+                                coresleep.core.as_ref().expect("core will always be Some"),
                             ) {
-                                critical.release();
+                                critical.release(
+                                    coresleep.core.take().expect("core will always be Some"),
+                                );
                                 this.core.set(None);
                                 return Poll::Ready(());
                             }
 
                             trace!(sleep = ?lim.interval, "keeping core and sleeping");
-                            sleep.as_mut().reset(critical.deadline);
+                            coresleep.sleep.as_mut().reset(critical.deadline);
                         }
                     }
                 }
