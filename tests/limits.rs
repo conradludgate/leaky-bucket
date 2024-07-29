@@ -4,10 +4,8 @@ use tokio::time::{Duration, Instant};
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_numerical_limits() {
     let limiter = RateLimiter::builder()
-        .max(10000)
         .refill(5000)
         .interval(Duration::from_millis(100))
-        .initial(0)
         .build();
     let start = Instant::now();
 

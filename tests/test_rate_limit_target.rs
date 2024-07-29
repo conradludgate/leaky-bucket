@@ -13,7 +13,6 @@ async fn test_rate_limit_target() {
     const DURATION: u64 = 2000;
 
     let limiter = RateLimiter::builder()
-        .max(1000)
         .refill(TARGET / INTERVALS)
         .interval(Duration::from_millis(DURATION / INTERVALS as u64))
         .build();

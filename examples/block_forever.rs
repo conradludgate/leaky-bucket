@@ -20,7 +20,7 @@ async fn main() {
     let mut a0 = Box::pin(limiter.acquire(1));
     // Poll once to ensure that the core task is assigned.
     assert!(a0.as_mut().poll(&mut cx).is_pending());
-    // assert!(a0.is_core());
+    assert!(a0.is_core());
 
     // We leak the core task, preventing the rate limiter from making progress
     // by assigning new core tasks.

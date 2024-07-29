@@ -227,7 +227,7 @@ extern crate alloc;
 #[macro_use]
 extern crate std;
 
-use core::task::{ready, Poll};
+use core::task::Poll;
 use core::time::Duration;
 use parking_lot::Mutex;
 use pin_project_lite::pin_project;
@@ -237,6 +237,20 @@ use tokio::sync::Notify;
 use tokio::time::{self, Sleep};
 
 use tokio::time::Instant;
+
+/// Default factor for how to calculate max refill value.
+const DEFAULT_REFILL_MAX_FACTOR: usize = 10;
+
+// /// Interval to bump the shared mutex guard to allow other parts of the system
+// /// to make process. Processes which loop should use this number to determine
+// /// how many times it should loop before calling [Guard::bump].
+// ///
+// /// If we do not respect this limit we might inadvertently end up starving other
+// /// tasks from making progress so that they can unblock.
+// const BUMP_LIMIT: usize = 16;
+
+/// The maximum supported balance.
+const MAX_BALANCE: usize = isize::MAX as usize;
 
 struct LeakyBucketConfig {
     /// Leaky buckets can drain at a fixed interval rate.
@@ -300,6 +314,15 @@ impl LeakyBucketState {
     pub fn bucket_is_empty(&self, config: &LeakyBucketConfig, now: Instant) -> bool {
         // if self.end is after now, the bucket is not empty
         config.prev_multiple_of_drain(now - config.epoch) <= self.end
+    }
+
+    pub fn tokens(&self, config: &LeakyBucketConfig, now: Instant) -> usize {
+        // if self.end is after now, the bucket is not empty
+        (config.bucket_width
+            - self
+                .end
+                .saturating_sub(config.prev_multiple_of_drain(now - config.epoch)))
+        .div_duration_f64(config.cost) as usize
     }
 
     /// Immedaitely adds tokens to the bucket, if there is space.
@@ -573,34 +596,34 @@ impl RateLimiter {
         self.queue.is_some()
     }
 
-    // /// Get the current token balance.
-    // ///
-    // /// This indicates how many tokens can be requested without blocking.
-    // ///
-    // /// # Examples
-    // ///
-    // /// ```
-    // /// use leaky_bucket::RateLimiter;
-    // ///
-    // /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
-    // /// let limiter = RateLimiter::builder()
-    // ///     .initial(100)
-    // ///     .build();
-    // ///
-    // /// assert_eq!(limiter.balance(), 100);
-    // /// limiter.acquire(10).await;
-    // /// assert_eq!(limiter.balance(), 90);
-    // /// # }
-    // /// ```
-    // pub fn balance(&self) -> usize {
-    //     self.critical.lock().balance
-    // }
+    /// Get the current token balance.
+    ///
+    /// This indicates how many tokens can be requested without blocking.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use leaky_bucket::RateLimiter;
+    ///
+    /// # #[tokio::main(flavor="current_thread", start_paused=true)] async fn main() {
+    /// let limiter = RateLimiter::builder()
+    ///     .initial(100)
+    ///     .build();
+    ///
+    /// assert_eq!(limiter.balance(), 100);
+    /// limiter.acquire(10).await;
+    /// assert_eq!(limiter.balance(), 90);
+    /// # }
+    /// ```
+    pub fn balance(&self) -> usize {
+        self.state.lock().tokens(&self.config, Instant::now())
+    }
 }
 
 /// A builder for a [`RateLimiter`].
 pub struct Builder {
     /// The max number of tokens.
-    max: usize,
+    max: Option<usize>,
     /// The initial count of tokens.
     initial: usize,
     /// Tokens to add every `per` duration.
@@ -632,7 +655,7 @@ impl Builder {
     /// [`refill`]: Builder::refill
     /// [`initial`]: Builder::initial
     pub fn max(&mut self, max: usize) -> &mut Self {
-        self.max = max;
+        self.max = Some(max);
         self
     }
 
@@ -749,14 +772,16 @@ impl Builder {
             fair,
         } = *self;
 
-        // let deadline = time::Instant::now() + self.interval;
+        let initial = initial.min(MAX_BALANCE);
+        let refill = refill.min(MAX_BALANCE);
 
-        // let max = match self.max {
-        //     Some(max) => max,
-        //     None => usize::max(self.refill, self.initial).saturating_mul(DEFAULT_REFILL_MAX_FACTOR),
-        // };
-
-        // let initial = usize::min(self.initial, max);
+        let max = match max {
+            Some(max) => max.min(MAX_BALANCE),
+            None => refill
+                .max(initial)
+                .saturating_mul(DEFAULT_REFILL_MAX_FACTOR)
+                .min(MAX_BALANCE),
+        };
 
         // how frequently we drain a single token on average
         let time_cost = interval / refill as u32;
@@ -797,7 +822,7 @@ impl Default for Builder {
     fn default() -> Self {
         Self {
             fair: true,
-            max: 10,
+            max: None,
             initial: 0,
             refill: 1,
             interval: time::Duration::from_millis(100),
@@ -902,5 +927,25 @@ impl Future for Acquire<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Acquire, RateLimiter};
+
+    fn is_send<T: Send>() {}
+    fn is_sync<T: Sync>() {}
+
+    #[test]
+    fn assert_send_sync() {
+        // is_send::<AcquireOwned>();
+        // is_sync::<AcquireOwned>();
+
+        is_send::<RateLimiter>();
+        is_sync::<RateLimiter>();
+
+        is_send::<Acquire<'_>>();
+        is_sync::<Acquire<'_>>();
     }
 }

@@ -53,8 +53,6 @@ async fn test_drop_core() {
 #[tokio::test(start_paused = true)]
 async fn test_core_move() {
     let limiter = RateLimiter::builder()
-        .max(10)
-        .initial(0)
         .interval(Duration::from_millis(50))
         .build();
 
@@ -66,20 +64,14 @@ async fn test_core_move() {
     let a2 = limiter.acquire(1);
     tokio::pin!(a1, a2);
 
-    println!("1");
-
     assert!(!a1.is_core());
     assert!(a1.as_mut().poll(&mut cx).is_pending());
     assert!(a1.is_core());
-
-    println!("2");
 
     // a2 is not a core because a1 is already a core.
     assert!(!a2.is_core());
     assert!(a2.as_mut().poll(&mut cx).is_pending());
     assert!(!a2.is_core());
-
-    println!("3");
 
     // drop the previous core and poll a2 again to become the new core.
     a1.set(limiter.acquire(1));
