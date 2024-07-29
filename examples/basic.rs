@@ -16,7 +16,7 @@ async fn main() {
     let b = limiter.acquire(3);
     let c = limiter.acquire(10);
 
-    let ((), (), ()) = tokio::join!(a, b, c);
+    let (_, _, _) = tokio::join!(a, b, c);
 
     println!("I made it in {:?}!", Instant::now().duration_since(start));
 }
