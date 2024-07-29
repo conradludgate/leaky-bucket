@@ -227,9 +227,8 @@ extern crate alloc;
 #[macro_use]
 extern crate std;
 
-use core::convert::TryFrom as _;
+use core::time::Duration;
 use parking_lot::Mutex;
-use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::{self};
 
@@ -540,6 +539,10 @@ impl RateLimiter {
     /// # }
     /// ```
     pub fn try_acquire(&self, permits: usize) -> bool {
+        if self.config.cost.mul_f64(permits as f64) > self.config.bucket_width {
+            return false;
+        }
+
         // check if we are the first in the queue
         let _notify_guard;
         if let Some(queue) = &self.queue {
@@ -742,29 +745,6 @@ impl Builder {
     /// the bucket rate limiter.
     ///
     /// This is 100ms by default.
-    ///
-    /// # Panics
-    ///
-    /// This panics if the provided interval does not fit within the millisecond
-    /// bounds of a [usize] or is zero.
-    ///
-    /// ```should_panic
-    /// use leaky_bucket::RateLimiter;
-    /// use tokio::time::Duration;
-    ///
-    /// let limiter = RateLimiter::builder()
-    ///     .interval(Duration::from_secs(u64::MAX))
-    ///     .build();
-    /// ```
-    ///
-    /// ```should_panic
-    /// use leaky_bucket::RateLimiter;
-    /// use tokio::time::Duration;
-    ///
-    /// let limiter = RateLimiter::builder()
-    ///     .interval(Duration::from_millis(0))
-    ///     .build();
-    /// ```
     ///
     /// # Examples
     ///
