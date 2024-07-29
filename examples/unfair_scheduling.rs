@@ -51,7 +51,13 @@ async fn main() -> Result<()> {
     let fair = Arc::new(RateLimiter::builder().max(1000).refill(100).build());
     grind("fair", &fair).await?;
 
-    let unfair = Arc::new(RateLimiter::builder().max(1000).refill(100).fair(false).build());
+    let unfair = Arc::new(
+        RateLimiter::builder()
+            .max(1000)
+            .refill(100)
+            .fair(false)
+            .build(),
+    );
     grind("unfair", &unfair).await?;
 
     Ok(())

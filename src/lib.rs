@@ -227,10 +227,14 @@ extern crate alloc;
 #[macro_use]
 extern crate std;
 
+use core::task::{ready, Poll};
 use core::time::Duration;
 use parking_lot::Mutex;
+use pin_project_lite::pin_project;
+use std::future::Future;
+use tokio::sync::futures::Notified;
 use tokio::sync::Notify;
-use tokio::time::{self};
+use tokio::time::{self, Sleep};
 
 use tokio::time::Instant;
 
@@ -338,82 +342,6 @@ impl LeakyBucketState {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use std::time::Duration;
-
-//     use tokio::time::Instant;
-
-//     use super::{LeakyBucketConfig, LeakyBucketState};
-
-//     #[tokio::test(start_paused = true)]
-//     async fn check() {
-//         let config = LeakyBucketConfig {
-//             epoch: Instant::now(),
-//             // drain the bucket every 0.5 seconds.
-//             drain_interval: Duration::from_millis(500),
-//             // average 100rps
-//             cost: Duration::from_millis(10),
-//             // burst up to 100 requests
-//             bucket_width: Duration::from_millis(1000),
-//         };
-
-//         let mut state = LeakyBucketState::new(Instant::now() - config.epoch);
-
-//         // supports burst
-//         {
-//             // should work for 100 requests this instant
-//             for _ in 0..100 {
-//                 state.add_tokens(&config, Instant::now(), 1.0).unwrap();
-//             }
-//             let ready = state.add_tokens(&config, Instant::now(), 1.0).unwrap_err();
-//             assert_eq!(ready - Instant::now(), Duration::from_millis(500));
-//         }
-
-//         // quantized refill
-//         {
-//             // after 499ms we should not drain any tokens.
-//             tokio::time::advance(Duration::from_millis(499)).await;
-//             let ready = state.add_tokens(&config, Instant::now(), 1.0).unwrap_err();
-//             assert_eq!(ready - Instant::now(), Duration::from_millis(1));
-
-//             // after 500ms we should have drained 50 tokens.
-//             tokio::time::advance(Duration::from_millis(1)).await;
-//             for _ in 0..50 {
-//                 state.add_tokens(&config, Instant::now(), 1.0).unwrap();
-//             }
-//             let ready = state.add_tokens(&config, Instant::now(), 1.0).unwrap_err();
-//             assert_eq!(ready - Instant::now(), Duration::from_millis(500));
-//         }
-
-//         // doesn't overfill
-//         {
-//             // after 1s we should have an empty bucket again.
-//             tokio::time::advance(Duration::from_secs(1)).await;
-//             assert!(state.bucket_is_empty(&config, Instant::now()));
-
-//             // after 1s more, we should not over count the tokens and allow more than 200 requests.
-//             tokio::time::advance(Duration::from_secs(1)).await;
-//             for _ in 0..100 {
-//                 state.add_tokens(&config, Instant::now(), 1.0).unwrap();
-//             }
-//             let ready = state.add_tokens(&config, Instant::now(), 1.0).unwrap_err();
-//             assert_eq!(ready - Instant::now(), Duration::from_millis(500));
-//         }
-
-//         // supports sustained rate over a long period
-//         {
-//             tokio::time::advance(Duration::from_secs(1)).await;
-
-//             // should sustain 100rps
-//             for _ in 0..2000 {
-//                 tokio::time::advance(Duration::from_millis(10)).await;
-//                 state.add_tokens(&config, Instant::now(), 1.0).unwrap();
-//             }
-//         }
-//     }
-// }
-
 /// blah blah
 pub struct RateLimiter {
     config: LeakyBucketConfig,
@@ -454,8 +382,8 @@ impl RateLimiter {
     /// limiter.acquire_one().await;
     /// # }
     /// ```
-    pub async fn acquire_one(&self) -> bool {
-        self.acquire(1).await
+    pub fn acquire_one(&self) -> Acquire {
+        self.acquire(1)
     }
 
     /// Acquire the given number of permits, suspending the current task until
@@ -477,36 +405,20 @@ impl RateLimiter {
     /// limiter.acquire(10).await;
     /// # }
     /// ```
-    pub async fn acquire(&self, count: usize) -> bool {
-        let mut throttled = false;
+    pub fn acquire(&self, count: usize) -> Acquire {
+        let step = self
+            .queue
+            .as_ref()
+            .map(|q| AcquireState::Queue {
+                queue: q.notified(),
+            })
+            .unwrap_or(AcquireState::Idle);
 
-        // wait until we are the first in the queue
-        let _notify_guard;
-        if let Some(queue) = &self.queue {
-            let mut notified = std::pin::pin!(queue.notified());
-            if !notified.as_mut().enable() {
-                throttled = true;
-                notified.await;
-            }
-
-            // notify the next waiter in the queue when we are done.
-            _notify_guard = NotifyGuard { notify: queue };
-        }
-
-        loop {
-            let now = tokio::time::Instant::now();
-
-            let res = self
-                .state
-                .lock()
-                .add_tokens(&self.config, now, count as f64);
-            match res {
-                Ok(()) => return throttled,
-                Err(ready_at) => {
-                    throttled = true;
-                    tokio::time::sleep_until(ready_at).await;
-                }
-            }
+        Acquire {
+            inner: self,
+            step,
+            count: count as f64,
+            throttled: false,
         }
     }
 
@@ -889,6 +801,106 @@ impl Default for Builder {
             initial: 0,
             refill: 1,
             interval: time::Duration::from_millis(100),
+        }
+    }
+}
+
+pin_project!(
+    /// thing
+    pub struct Acquire<'a> {
+        inner: &'a RateLimiter,
+        #[pin]
+        step: AcquireState<'a>,
+        count: f64,
+        throttled: bool,
+    }
+
+    impl<'a> PinnedDrop for Acquire<'a> {
+        fn drop(this: Pin<&mut Self>) {
+            if matches!(this.step, AcquireState::Waiting { .. }) {
+                if let Some(queue) = &this.inner.queue {
+                    queue.notify_one();
+                }
+            }
+        }
+    }
+);
+
+pin_project!(
+    #[project = AcquireStateProj]
+    enum AcquireState<'a> {
+        Idle,
+        Queue {
+            #[pin]
+            queue: Notified<'a>,
+        },
+        Waiting {
+            #[pin]
+            sleep: Sleep,
+        },
+        Done,
+    }
+);
+
+impl Acquire<'_> {
+    /// thing
+    pub fn is_core(&self) -> bool {
+        matches!(self.step, AcquireState::Waiting { .. })
+    }
+}
+
+impl Future for Acquire<'_> {
+    type Output = bool;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if *this.count == 0.0 {
+            this.step.set(AcquireState::Done);
+            return Poll::Ready(true);
+        }
+
+        loop {
+            match this.step.as_mut().project() {
+                AcquireStateProj::Idle => {}
+                AcquireStateProj::Queue { queue } => {
+                    if queue.poll(cx).is_pending() {
+                        *this.throttled = true;
+                        return Poll::Pending;
+                    }
+                }
+                AcquireStateProj::Waiting { sleep } => {
+                    if sleep.poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+                AcquireStateProj::Done => panic!("polled after completion"),
+            }
+
+            let now = tokio::time::Instant::now();
+            let res = this
+                .inner
+                .state
+                .lock()
+                .add_tokens(&this.inner.config, now, *this.count);
+
+            match res {
+                Ok(()) => {
+                    if let Some(queue) = &this.inner.queue {
+                        queue.notify_one();
+                    }
+                    this.step.set(AcquireState::Done);
+                    return Poll::Ready(*this.throttled);
+                }
+                Err(ready_at) => {
+                    *this.throttled = true;
+                    this.step.set(AcquireState::Waiting {
+                        sleep: tokio::time::sleep_until(ready_at),
+                    });
+                }
+            }
         }
     }
 }
