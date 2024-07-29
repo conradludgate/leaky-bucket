@@ -779,14 +779,6 @@ impl Builder {
     ///
     /// [`refill`]: Builder::refill
     pub fn interval(&mut self, interval: Duration) -> &mut Self {
-        assert! {
-            interval.as_millis() != 0,
-            "interval must be non-zero",
-        };
-        assert! {
-            u64::try_from(interval.as_millis()).is_ok(),
-            "interval must fit within a 64-bit integer"
-        };
         self.interval = interval;
         self
     }
