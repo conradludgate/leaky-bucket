@@ -311,18 +311,16 @@ impl LeakyBucketState {
         Self { end: now }
     }
 
-    pub fn bucket_is_empty(&self, config: &LeakyBucketConfig, now: Instant) -> bool {
-        // if self.end is after now, the bucket is not empty
-        config.prev_multiple_of_drain(now - config.epoch) <= self.end
-    }
-
     pub fn tokens(&self, config: &LeakyBucketConfig, now: Instant) -> usize {
-        // if self.end is after now, the bucket is not empty
-        (config.bucket_width
-            - self
-                .end
-                .saturating_sub(config.prev_multiple_of_drain(now - config.epoch)))
-        .div_duration_f64(config.cost) as usize
+        let now = config.prev_multiple_of_drain(now - config.epoch);
+        dbg!(now, self.end);
+
+        let from_end = self.end.saturating_sub(now);
+
+        config
+            .bucket_width
+            .saturating_sub(from_end)
+            .div_duration_f64(config.cost) as usize
     }
 
     /// Immedaitely adds tokens to the bucket, if there is space.
@@ -331,16 +329,15 @@ impl LeakyBucketState {
     pub fn add_tokens(
         &mut self,
         config: &LeakyBucketConfig,
+        started: Instant,
         now: Instant,
         n: f64,
     ) -> Result<(), Instant> {
         // round down to the last time we would have drained the bucket.
         let now = config.prev_multiple_of_drain(now - config.epoch);
+        let started = config.prev_multiple_of_drain(started - config.epoch);
 
         let n = config.cost.mul_f64(n);
-
-        let end_plus_n = self.end + n;
-        let start_plus_n = end_plus_n.saturating_sub(config.bucket_width);
 
         //       start          end
         //       |     start+n  |     end+n
@@ -352,10 +349,15 @@ impl LeakyBucketState {
         // at now2, the bucket would be partially filled if we add n tokens.
         // at now3, the bucket would start completely empty before we add n tokens.
 
-        if end_plus_n <= now {
-            self.end = now + n;
-            Ok(())
-        } else if start_plus_n <= now {
+        let mut end = self.end;
+        if end < started {
+            end = started;
+        }
+
+        let end_plus_n = end + n;
+        let start_plus_n = end_plus_n.saturating_sub(config.bucket_width);
+
+        if start_plus_n <= now {
             self.end = end_plus_n;
             Ok(())
         } else {
@@ -386,10 +388,6 @@ impl Drop for NotifyGuard<'_> {
 }
 
 impl RateLimiter {
-    fn steady_rps(&self) -> f64 {
-        self.config.cost.as_secs_f64().recip()
-    }
-
     /// Acquire a single permit.
     ///
     /// # Examples
@@ -442,6 +440,7 @@ impl RateLimiter {
             step,
             count: count as f64,
             throttled: false,
+            started: Instant::now(),
         }
     }
 
@@ -495,7 +494,7 @@ impl RateLimiter {
         let res = self
             .state
             .lock()
-            .add_tokens(&self.config, now, permits as f64);
+            .add_tokens(&self.config, now, now, permits as f64);
         match res {
             Ok(()) => true,
             Err(_) => false,
@@ -838,6 +837,7 @@ pin_project!(
         step: AcquireState<'a>,
         count: f64,
         throttled: bool,
+        started: Instant,
     }
 
     impl<'a> PinnedDrop for Acquire<'a> {
@@ -905,11 +905,12 @@ impl Future for Acquire<'_> {
             }
 
             let now = tokio::time::Instant::now();
-            let res = this
-                .inner
-                .state
-                .lock()
-                .add_tokens(&this.inner.config, now, *this.count);
+            let res = this.inner.state.lock().add_tokens(
+                &this.inner.config,
+                *this.started,
+                now,
+                *this.count,
+            );
 
             match res {
                 Ok(()) => {
